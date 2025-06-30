@@ -144,6 +144,13 @@ class AgentSystem():
 
 
 def search(args):
+    """
+    
+    """
+     # 1. File Path Creation: Creates path for saving results (e.g., results/mmlu_gpt3.5_results_run_archive.json)
+     # Resume Capability: If archive file exists, load it and determine where to resume
+     # Generation Tracking: Finds the last completed generation number to continue from
+     #Initial Archive: If no existing file, loads initial candidate solutions from get_init_archive()
     file_path = os.path.join(args.save_dir, f"{args.expr_name}_run_archive.json")
     if os.path.exists(file_path):
         with open(file_path, 'r') as json_file:
@@ -157,18 +164,21 @@ def search(args):
         start = 0
 
     for solution in archive:
+        # Skip already evaluated solutions
         if 'fitness' in solution:
             continue
 
         solution['generation'] = "initial"
         print(f"============Initial Archive: {solution['name']}=================")
         try:
+            # Measure Performance: The code is tested on validation questions, returning accuracy list
+            # Each solution contains generated Python code that gets executed via evaluate_forward_fn()
             acc_list = evaluate_forward_fn(args, solution["code"])
         except Exception as e:
             print("During evaluating initial archive:")
             print(e)
             continue
-
+        # Uses bootstrap confidence intervals for statistical robustness
         fitness_str = bootstrap_confidence_interval(acc_list)
         solution['fitness'] = fitness_str
 
@@ -179,14 +189,18 @@ def search(args):
 
     for n in range(start, args.n_generation):
         print(f"============Generation {n + 1}=================")
+        # Prompt Creation: get_prompt(archive) creates prompts based on current best solutions
         system_prompt, prompt = get_prompt(archive)
         msg_list = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ]
         try:
+            # LLM Generation: GPT generates a new solution (code + strategy) based on archive
+            # JSON Format: Response contains fields like name, code, thought
             next_solution = get_json_response_from_gpt_reflect(msg_list, args.model)
-
+        
+            # Self-Reflection: Two rounds of reflexion where GPT critiques and improves its own solution
             Reflexion_prompt_1, Reflexion_prompt_2 = get_reflexion_prompt(archive[-1] if n > 0 else None)
             # Reflexion 1
             msg_list.append({"role": "assistant", "content": str(next_solution)})
@@ -204,6 +218,7 @@ def search(args):
 
         acc_list = []
         for _ in range(args.debug_max):
+            # Quality Control: Reject solutions with near-zero accuracy
             try:
                 acc_list = evaluate_forward_fn(args, next_solution["code"])
                 if np.mean(acc_list) < 0.01 and SEARCHING_MODE:
@@ -221,8 +236,9 @@ def search(args):
                     print(e)
                     continue
                 continue
-        if not acc_list:
-            n -= 1
+        # If all debug attempts failed
+        if not acc_list: 
+            n -= 1 # Don't count this generation
             continue
 
         fitness_str = bootstrap_confidence_interval(acc_list)
@@ -277,18 +293,104 @@ def evaluate(args):
 
 
 def evaluate_forward_fn(args, forward_str):
-    # dynamically define forward()
-    # modified from https://github.com/luchris429/DiscoPOP/blob/main/scripts/launch_evo.py
+    """
+    # ---------------------------------------------------------------------
+    # FLOW OF THE FUNCTION:
+    Generated Code → Execute → Install as forward() → Load Questions → 
+    Format Tasks → Parallel Processing → Parse Answers → Calculate Accuracy → 
+    Return Results
+    # ---------------------------------------------------------------------
+
+    
+    # ---------------------------------------------------------------------
+    # BACKGROUND:
+    - GPT generates Python code as a string, not executable code. 
+    - We need to convert this string into actual runnable Python functions.
+    # ---------------------------------------------------------------------
+    
+    
+    # ---------------------------------------------------------------------
+    # NAMESPACE: 
+    # What is a namespace?
+    - A namespace is a dictionary that maps names (variables, functions) to their values
+    - Python uses namespaces to keep track of what names exist in different scopes.
+    - By creating an empty namespace, we're preparing a "clean slate" to execute code.
+    
+    # Why use a separate namespace?
+    - Isolation: Prevents the generated code from interfering with our main program
+    - Security: Limits what the generated code can access
+    - Inspection: Allows us to see exactly what was define
+    # ---------------------------------------------------------------------
+
+    
+
+    # ---------------------------------------------------------------------
+    # DYNAMIC CODE EXECUTION:
+    exec() executes Python code from a string
+    - forward_str: The Python code string to execute
+    - globals(): The global namespace (built-in functions, imports, etc.)
+    - namespace: Our local namespace where new definitions go
+    # ---------------------------------------------------------------------
+
+
+    # ---------------------------------------------------------------------
+    #  DYNAMIC METHOD ASSIGNMENT:
+
+    setattr(object, name, value) 
+    - dynamically sets an attribute on an object
+    - setattr(AgentSystem, "forward", func) is equivalent to: AgentSystem.forward = func
+    - But more powerful: Can set attributes with variable names
+
+    # Before:
+    class AgentSystem:
+        def __init__(self):
+            pass
+        # No 'forward' method exists!
+
+    # After setattr():
+    class AgentSystem:
+        def __init__(self):
+            pass
+        def forward(self, task):  # This is the GPT-generated function!
+            # Whatever code GPT wrote
+            return "A"
+    # ---------------------------------------------------------------------
+
+
+    """
+    # --------------------------------------------------------
+    # Step 1: Dynamic Code Execution
+
+    # 1.1 Namespace Creation
     namespace = {}
+    namespace = {}  # Empty dictionary to hold the generated function
+
+    # 1.2 Dynamic Code Execution
     exec(forward_str, globals(), namespace)
+
+    # 1.3 Extracting the Defined Function
     names = list(namespace.keys())
+
+    # We expect GPT to define exactly one function (the agent strategy)
+    # Multiple functions would be ambiguous (which one to use?)
+    # Zero functions means the generated code was invalid
     if len(names) != 1:
         raise AssertionError(f"{len(names)} things in namespace. Please only provide 1")
+    
+    # 1. 4 Function Validation
+    # callable(obj) returns True if the object can be called like a function
+    # This ensures we actually got a function, not a variable
     func = namespace[names[0]]
     if not callable(func):
         raise AssertionError(f"{func} is not callable")
+    
+    # 1. 5 Dynamic Method Assignment
     setattr(AgentSystem, "forward", func)
 
+
+
+    # --------------------------------------------------------
+    # Step 2: Dataset Preparation
     LETTER_TO_INDEX = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
     # set seed 0 for valid set
     df = pandas.read_csv(args.data_filename)
@@ -300,24 +402,40 @@ def evaluate_forward_fn(args, forward_str):
         examples = examples[:args.valid_size] * args.n_repreat
     else:
         examples = examples[args.valid_size:args.valid_size + args.test_size] * args.n_repreat
+    # --------------------------------------------------------
 
+    # Step 3: Question Formatting
     questions = [format_multichoice_question(example) for example in examples]
     answers = [LETTER_TO_INDEX[example['Answer']] for example in examples]
 
     print(f"problem length: {len(examples)}")
     max_workers = min(len(examples), args.max_workers) if args.multiprocessing else 1
 
+    # --------------------------------------------------------
+    # Step 4: Task Queue Creation
     task_queue = []
     for q in questions:
         taskInfo = Info('task', 'User', q, -1)
         task_queue.append(taskInfo)
 
+    # Agent Creation: Creates an AgentSystem instance with the dynamically assigned forward method
     agentSystem = AgentSystem()
+    # --------------------------------------------------------
 
+
+    # --------------------------------------------------------
+    # Step 5: Parallel Execution
     acc_list = []
+    # Parallel Processing: Uses ThreadPoolExecutor to process multiple questions simultaneously
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Function Mapping: Each task in the queue gets passed to agentSystem.forward
+        # Note: The dynamically generated forward function receives each Info object and should return the agent's answer.
         results = list(tqdm(executor.map(agentSystem.forward, task_queue), total=len(task_queue)))
+    # --------------------------------------------------------
 
+
+    # --------------------------------------------------------
+    # Step 6: Answer Parsing and Evaluation
     for q_idx, res in enumerate(results):
         try:
             if isinstance(res, str) and res in LETTER_TO_INDEX:
@@ -356,6 +474,8 @@ def evaluate_forward_fn(args, forward_str):
         else:
             acc_list.append(0)
     print(f"acc: {bootstrap_confidence_interval(acc_list)}")
+    # --------------------------------------------------------
+
     return acc_list
 
 
